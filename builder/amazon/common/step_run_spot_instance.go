@@ -20,6 +20,14 @@ import (
 	"github.com/hashicorp/packer/template/interpolate"
 )
 
+func boolPointer(tf bool) *bool {
+	return &tf
+}
+
+func stringPointer(str string) *string {
+	return &str
+}
+
 type StepRunSpotInstance struct {
 	AssociatePublicIpAddress          bool
 	BlockDevices                      BlockDevices
@@ -50,10 +58,6 @@ func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn *ec2.EC2) (s
 	spotPrice := s.SpotPrice
 
 	if spotPrice == "auto" {
-		ui.Message(fmt.Sprintf(
-			"Finding spot price for %s %s...",
-			s.SpotPriceProduct, s.InstanceType))
-
 		// Detect the spot price
 		startTime := time.Now().Add(-1 * time.Hour)
 		resp, err := ec2conn.DescribeSpotPriceHistory(&ec2.DescribeSpotPriceHistoryInput{
@@ -76,7 +80,7 @@ func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn *ec2.EC2) (s
 			}
 			if price == 0 || current < price {
 				price = current
-				if azConfig == "" {
+				if az == "" {
 					az = *history.AvailabilityZone
 				}
 			}
@@ -97,11 +101,11 @@ func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn *ec2.EC2) (s
 }
 
 // Set up network interfaces struct for the instance request
-func (s *StepRunSpotInstance) ConfigureNetworkInterfaces(state) *ec2.InstanceNetworkInterfaceSpecification {
+func (s *StepRunSpotInstance) ConfigureNetworkInterface(state multistep.StateBag) *ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest {
 	securityGroupIds := aws.StringSlice(state.Get("securityGroupIds").([]string))
 	subnetId := state.Get("subnet_id").(string)
 
-	networkInterfaces = ec2.InstanceNetworkInterfaceSpecification{
+	networkInterface := ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{
 		SubnetId:            &subnetId,
 		Groups:              securityGroupIds,
 		DeleteOnTermination: aws.Bool(true),
@@ -109,26 +113,46 @@ func (s *StepRunSpotInstance) ConfigureNetworkInterfaces(state) *ec2.InstanceNet
 	}
 
 	if subnetId != "" && s.AssociatePublicIpAddress {
-		networkInterfaces.SetAssociatePublicIpAddress(s.AssociatePublicIpAddress)
+		networkInterface.SetAssociatePublicIpAddress(s.AssociatePublicIpAddress)
 	}
 
-	return &networkInterfaces
+	return &networkInterface
 }
 
-func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
-	networkInterface *ec2.InstanceNetworkInterfaceSpecification, marketOptions *ec2.LaunchTemplateInstanceMarketOptionsRequest) {
+func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string, networkInterface *ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest, marketOptions *ec2.LaunchTemplateInstanceMarketOptionsRequest) *ec2.RequestLaunchTemplateData {
+	// Convert the BlockDeviceMapping into a
+	// LaunchTemplateBlockDeviceMappingRequest. These structs are identical,
+	// except for the EBS field -- on one, that field contains a
+	// LaunchTemplateEbsBlockDeviceRequest, and on the other, it contains an
+	// EbsBlockDevice. The EbsBlockDevice and
+	// LaunchTemplateEbsBlockDeviceRequest structs are themselves
+	// identical except for the struct's name, so you can cast one directly
+	// into the other.
+	blockDeviceMappings := s.BlockDevices.BuildLaunchDevices()
+	var launchMappingRequests []*ec2.LaunchTemplateBlockDeviceMappingRequest
+	for _, mapping := range blockDeviceMappings {
+		launchRequest := &ec2.LaunchTemplateBlockDeviceMappingRequest{
+			DeviceName:  mapping.DeviceName,
+			Ebs:         (*ec2.LaunchTemplateEbsBlockDeviceRequest)(mapping.Ebs),
+			NoDevice:    mapping.NoDevice,
+			VirtualName: mapping.VirtualName,
+		}
+		launchMappingRequests = append(launchMappingRequests, launchRequest)
+	}
+
+	// Create a launch template.
 	templateData := ec2.RequestLaunchTemplateData{
-		BlockDeviceMappings:   s.BlockDevices.BuildLaunchDevices(),
-		DisableApiTermination: false,
+		BlockDeviceMappings:   launchMappingRequests,
+		DisableApiTermination: boolPointer(false),
 		EbsOptimized:          &s.EbsOptimized,
-		IamInstanceProfile:    &ec2.IamInstanceProfileSpecification{Name: &s.IamInstanceProfile},
+		IamInstanceProfile:    &ec2.LaunchTemplateIamInstanceProfileSpecificationRequest{Name: &s.IamInstanceProfile},
 		ImageId:               &s.SourceAMI,
 		InstanceMarketOptions: marketOptions,
-		NetworkInterfaces:     []*ec2.InstanceNetworkInterfaceSpecification{networkInterface},
+		NetworkInterfaces:     []*ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{networkInterface},
 		Placement: &ec2.LaunchTemplatePlacementRequest{
 			AvailabilityZone: &az,
 		},
-		SecurityGroupIds: securityGroupIds,
+		SecurityGroupIds: networkInterface.Groups,
 		UserData:         userData,
 	}
 
@@ -141,6 +165,8 @@ func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
 	if s.Comm.SSHKeyPairName != "" {
 		templateData.SetKeyName(s.Comm.SSHKeyPairName)
 	}
+
+	return &templateData
 }
 
 func (s *StepRunSpotInstance) LoadUserData() (string, error) {
@@ -190,7 +216,9 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 	}
 	az := azConfig
 
-	spotPrice, err := s.CalculateSpotPrice(az)
+	ui.Message(fmt.Sprintf("Finding spot price for %s %s...",
+		s.SpotPriceProduct, s.InstanceType))
+	spotPrice, err := s.CalculateSpotPrice(az, ec2conn)
 	if err != nil {
 		state.Put("error", err)
 		ui.Error(err.Error())
@@ -221,15 +249,21 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 	// This prints the tags to the ui; it doesn't actually add them to the
 	// instance yet
 	ec2Tags.Report(ui)
+	// LaunchTemplateInstanceMarketOptionsRequest
+	// LaunchTemplateSpotMarketOptionsRequest
 
-	marketOptions := ec2.LaunchTemplateInstanceMarketOptionsRequest{
-		MaxPrice: s.SpotPrice,
+	spotOptions := ec2.LaunchTemplateSpotMarketOptionsRequest{
+		MaxPrice: &s.SpotPrice,
 	}
 	if s.BlockDurationMinutes != 0 {
-		marketOptions.BlockDurationMinutes = &s.BlockDurationMinutes
+		spotOptions.BlockDurationMinutes = &s.BlockDurationMinutes
 	}
+	marketOptions := &ec2.LaunchTemplateInstanceMarketOptionsRequest{
+		SpotOptions: &spotOptions,
+	}
+	marketOptions.SetMarketType(ec2.MarketTypeSpot)
 
-	networkInterface := ConfigureNetworkInterfaces(state)
+	networkInterface := s.ConfigureNetworkInterface(state)
 
 	// Create a launch template for the instance
 	ui.Message("Loading User Data File...")
@@ -239,11 +273,11 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		return multistep.ActionHalt
 	}
 	ui.Message("Creating Spot Fleet launch template...")
-	templateData := CreateTemplateData(userData, az, networkInterface, marketOptions)
-	launchTemplate := CreateLaunchTemplateInput{
-		LaunchTemplateData: &templateData,
-		LaunchTemplateName: "packer-fleet-launch-template",
-		VersionDescription: "template generated by packer for launching spot instances",
+	templateData := s.CreateTemplateData(&userData, az, networkInterface, marketOptions)
+	launchTemplate := &ec2.CreateLaunchTemplateInput{
+		LaunchTemplateData: templateData,
+		LaunchTemplateName: stringPointer("packer-fleet-launch-template"),
+		VersionDescription: stringPointer("template generated by packer for launching spot instances"),
 	}
 
 	// Tell EC2 to create the template
@@ -264,23 +298,23 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 
 	createFleetInput := &ec2.CreateFleetInput{
 		LaunchTemplateConfigs: []*ec2.FleetLaunchTemplateConfigRequest{
-			*ec2.FleetLaunchTemplateConfigRequest{
+			&ec2.FleetLaunchTemplateConfigRequest{
 				LaunchTemplateSpecification: &ec2.FleetLaunchTemplateSpecificationRequest{
-					LaunchTemplateName: "packer-fleet-launch-template",
+					LaunchTemplateName: stringPointer("packer-fleet-launch-template"),
 					// Overrides:          []*ec2.FleetLaunchTemplateOverrides{override},
 				},
 			},
 		},
 		OnDemandOptions:                  &ec2.OnDemandOptionsRequest{},
-		ReplaceUnhealthyInstances:        false,
+		ReplaceUnhealthyInstances:        boolPointer(false),
 		TargetCapacitySpecification:      &ec2.TargetCapacitySpecificationRequest{},
-		TerminateInstancesWithExpiration: true,
-		Type:                             "instant",
+		TerminateInstancesWithExpiration: boolPointer(true),
+		Type:                             stringPointer("instant"),
 	}
 
 	// Create the request for the spot instance.
 	req, createOutput := ec2conn.CreateFleetRequest(createFleetInput)
-	ui.Message(fmt.Sprintf("Sending spot request (%s)...", *req.spotRequestId))
+	ui.Message(fmt.Sprintf("Sending spot request (%s)...", req.RequestID))
 
 	// Tag the spot instance request (not the eventual spot instance)
 	spotTags, err := s.SpotTags.EC2Tags(s.Ctx, *ec2conn.Config.Region, state)
@@ -300,7 +334,7 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		}.Run(ctx, func(ctx context.Context) error {
 			_, err := ec2conn.CreateTags(&ec2.CreateTagsInput{
 				Tags:      spotTags,
-				Resources: []*string{req.RequestId},
+				Resources: []*string{stringPointer(req.RequestID)},
 			})
 			return err
 		})
@@ -316,13 +350,13 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 	err = req.Send()
 
 	if err != nil {
-		err := fmt.Errorf("Error waiting for spot request (%s) to become ready: %s", *req.RequestId, err)
+		err := fmt.Errorf("Error waiting for spot request (%s) to become ready: %s", req.RequestID, err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
 
-	instanceId = createOutput.Instances[0].InstanceIds[0]
+	instanceId = *createOutput.Instances[0].InstanceIds[0]
 
 	// Set the instance ID so that the cleanup works properly
 	s.instanceId = instanceId
