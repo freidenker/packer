@@ -45,50 +45,9 @@ type StepRunSpotInstance struct {
 	spotRequest *ec2.SpotInstanceRequest
 }
 
-func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
-	ec2conn := state.Get("ec2").(*ec2.EC2)
-	securityGroupIds := aws.StringSlice(state.Get("securityGroupIds").([]string))
-	ui := state.Get("ui").(packer.Ui)
-
-	userData := s.UserData
-	if s.UserDataFile != "" {
-		contents, err := ioutil.ReadFile(s.UserDataFile)
-		if err != nil {
-			state.Put("error", fmt.Errorf("Problem reading user data file: %s", err))
-			return multistep.ActionHalt
-		}
-
-		userData = string(contents)
-	}
-
-	// Test if it is encoded already, and if not, encode it
-	if _, err := base64.StdEncoding.DecodeString(userData); err != nil {
-		log.Printf("[DEBUG] base64 encoding user data...")
-		userData = base64.StdEncoding.EncodeToString([]byte(userData))
-	}
-
-	ui.Say("Launching a source AWS instance...")
-	image, ok := state.Get("source_image").(*ec2.Image)
-	if !ok {
-		state.Put("error", fmt.Errorf("source_image type assertion failed"))
-		return multistep.ActionHalt
-	}
-	s.SourceAMI = *image.ImageId
-
-	if s.ExpectedRootDevice != "" && *image.RootDeviceType != s.ExpectedRootDevice {
-		state.Put("error", fmt.Errorf(
-			"The provided source AMI has an invalid root device type.\n"+
-				"Expected '%s', got '%s'.",
-			s.ExpectedRootDevice, *image.RootDeviceType))
-		return multistep.ActionHalt
-	}
-
+func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn *ec2.EC2) (string, error) {
+	// Calculate the spot price for a given availability zone
 	spotPrice := s.SpotPrice
-	azConfig := ""
-	if azRaw, ok := state.GetOk("availability_zone"); ok {
-		azConfig = azRaw.(string)
-	}
-	az := azConfig
 
 	if spotPrice == "auto" {
 		ui.Message(fmt.Sprintf(
@@ -104,10 +63,7 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 			StartTime:           &startTime,
 		})
 		if err != nil {
-			err := fmt.Errorf("Error finding spot price: %s", err)
-			state.Put("error", err)
-			ui.Error(err.Error())
-			return multistep.ActionHalt
+			return "", fmt.Errorf("Error finding spot price: %s", err)
 		}
 
 		var price float64
@@ -126,10 +82,7 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 			}
 		}
 		if price == 0 {
-			err := fmt.Errorf("No candidate spot prices found!")
-			state.Put("error", err)
-			ui.Error(err.Error())
-			return multistep.ActionHalt
+			return "", fmt.Errorf("No candidate spot prices found!")
 		} else {
 			// Add 0.5 cents to minimum spot bid to ensure capacity will be available
 			// Avoids price-too-low error in active markets which can fluctuate
@@ -139,101 +92,200 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		spotPrice = strconv.FormatFloat(price, 'f', -1, 64)
 	}
 
+	return spotPrice, nil
+
+}
+
+// Set up network interfaces struct for the instance request
+func (s *StepRunSpotInstance) ConfigureNetworkInterfaces(state) *ec2.InstanceNetworkInterfaceSpecification {
+	securityGroupIds := aws.StringSlice(state.Get("securityGroupIds").([]string))
+	subnetId := state.Get("subnet_id").(string)
+
+	networkInterfaces = ec2.InstanceNetworkInterfaceSpecification{
+		SubnetId:            &subnetId,
+		Groups:              securityGroupIds,
+		DeleteOnTermination: aws.Bool(true),
+		DeviceIndex:         aws.Int64(0),
+	}
+
+	if subnetId != "" && s.AssociatePublicIpAddress {
+		networkInterfaces.SetAssociatePublicIpAddress(s.AssociatePublicIpAddress)
+	}
+
+	return &networkInterfaces
+}
+
+func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
+	networkInterface *ec2.InstanceNetworkInterfaceSpecification, marketOptions *ec2.LaunchTemplateInstanceMarketOptionsRequest) {
+	templateData := ec2.RequestLaunchTemplateData{
+		BlockDeviceMappings:   s.BlockDevices.BuildLaunchDevices(),
+		DisableApiTermination: false,
+		EbsOptimized:          &s.EbsOptimized,
+		IamInstanceProfile:    &ec2.IamInstanceProfileSpecification{Name: &s.IamInstanceProfile},
+		ImageId:               &s.SourceAMI,
+		InstanceMarketOptions: marketOptions,
+		NetworkInterfaces:     []*ec2.InstanceNetworkInterfaceSpecification{networkInterface},
+		Placement: &ec2.LaunchTemplatePlacementRequest{
+			AvailabilityZone: &az,
+		},
+		SecurityGroupIds: securityGroupIds,
+		UserData:         userData,
+	}
+
+	// If instance type is not set, we'll just pick the lowest priced instance
+	// available.
+	if s.InstanceType != "" {
+		templateData.SetInstanceType(s.InstanceType)
+	}
+
+	if s.Comm.SSHKeyPairName != "" {
+		templateData.SetKeyName(s.Comm.SSHKeyPairName)
+	}
+}
+
+func (s *StepRunSpotInstance) LoadUserData() (string, error) {
+	userData := s.UserData
+	if s.UserDataFile != "" {
+		contents, err := ioutil.ReadFile(s.UserDataFile)
+		if err != nil {
+			return "", fmt.Errorf("Problem reading user data file: %s", err)
+		}
+
+		userData = string(contents)
+	}
+
+	// Test if it is encoded already, and if not, encode it
+	if _, err := base64.StdEncoding.DecodeString(userData); err != nil {
+		log.Printf("[DEBUG] base64 encoding user data...")
+		userData = base64.StdEncoding.EncodeToString([]byte(userData))
+	}
+	return userData, nil
+}
+
+func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
+	ec2conn := state.Get("ec2").(*ec2.EC2)
+	ui := state.Get("ui").(packer.Ui)
+
+	ui.Say("Launching a spot AWS instance...")
+
+	// Get and validate the source AMI
+	image, ok := state.Get("source_image").(*ec2.Image)
+	if !ok {
+		state.Put("error", fmt.Errorf("source_image type assertion failed"))
+		return multistep.ActionHalt
+	}
+	s.SourceAMI = *image.ImageId
+
+	if s.ExpectedRootDevice != "" && *image.RootDeviceType != s.ExpectedRootDevice {
+		state.Put("error", fmt.Errorf(
+			"The provided source AMI has an invalid root device type.\n"+
+				"Expected '%s', got '%s'.",
+			s.ExpectedRootDevice, *image.RootDeviceType))
+		return multistep.ActionHalt
+	}
+
+	azConfig := ""
+	if azRaw, ok := state.GetOk("availability_zone"); ok {
+		azConfig = azRaw.(string)
+	}
+	az := azConfig
+
+	spotPrice, err := s.CalculateSpotPrice(az)
+	if err != nil {
+		state.Put("error", err)
+		ui.Error(err.Error())
+		return multistep.ActionHalt
+	}
+
+	ui.Message(fmt.Sprintf("Determined spot instance price of: %s.", spotPrice))
+
 	var instanceId string
 
-	ui.Say("Adding tags to source instance")
+	ui.Say("Interpolating tags for spot instance...")
+	// s.Tags will tag the eventually launched instance
+	// s.SpotTags apply to the spot request itself, and do not automatically
+	// get applied to the spot instance that is launched once the request is
+	// fulfilled
 	if _, exists := s.Tags["Name"]; !exists {
 		s.Tags["Name"] = "Packer Builder"
 	}
 
+	// Convert tags from the tag map provided by the user into *ec2.Tag s
 	ec2Tags, err := s.Tags.EC2Tags(s.Ctx, *ec2conn.Config.Region, state)
 	if err != nil {
-		err := fmt.Errorf("Error tagging source instance: %s", err)
+		err := fmt.Errorf("Error generating tags for source instance: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
+	// This prints the tags to the ui; it doesn't actually add them to the
+	// instance yet
 	ec2Tags.Report(ui)
 
-	ui.Message(fmt.Sprintf(
-		"Requesting spot instance '%s' for: %s",
-		s.InstanceType, spotPrice))
-
-	runOpts := &ec2.RequestSpotLaunchSpecification{
-		ImageId:            &s.SourceAMI,
-		InstanceType:       &s.InstanceType,
-		UserData:           &userData,
-		IamInstanceProfile: &ec2.IamInstanceProfileSpecification{Name: &s.IamInstanceProfile},
-		Placement: &ec2.SpotPlacement{
-			AvailabilityZone: &az,
-		},
-		BlockDeviceMappings: s.BlockDevices.BuildLaunchDevices(),
-		EbsOptimized:        &s.EbsOptimized,
-	}
-
-	subnetId := state.Get("subnet_id").(string)
-
-	if subnetId != "" && s.AssociatePublicIpAddress {
-		runOpts.NetworkInterfaces = []*ec2.InstanceNetworkInterfaceSpecification{
-			{
-				DeviceIndex:              aws.Int64(0),
-				AssociatePublicIpAddress: &s.AssociatePublicIpAddress,
-				SubnetId:                 &subnetId,
-				Groups:                   securityGroupIds,
-				DeleteOnTermination:      aws.Bool(true),
-			},
-		}
-	} else {
-		runOpts.SubnetId = &subnetId
-		runOpts.SecurityGroupIds = securityGroupIds
-	}
-
-	if s.Comm.SSHKeyPairName != "" {
-		runOpts.KeyName = &s.Comm.SSHKeyPairName
-	}
-	spotInstanceInput := &ec2.RequestSpotInstancesInput{
-		LaunchSpecification: runOpts,
-		SpotPrice:           &spotPrice,
+	marketOptions := ec2.LaunchTemplateInstanceMarketOptionsRequest{
+		MaxPrice: s.SpotPrice,
 	}
 	if s.BlockDurationMinutes != 0 {
-		spotInstanceInput.BlockDurationMinutes = &s.BlockDurationMinutes
+		marketOptions.BlockDurationMinutes = &s.BlockDurationMinutes
 	}
 
-	runSpotResp, err := ec2conn.RequestSpotInstances(spotInstanceInput)
+	networkInterface := ConfigureNetworkInterfaces(state)
+
+	// Create a launch template for the instance
+	ui.Message("Loading User Data File...")
+	userData, err := s.LoadUserData()
 	if err != nil {
-		err := fmt.Errorf("Error launching source spot instance: %s", err)
+		state.Put("error", err)
+		return multistep.ActionHalt
+	}
+	ui.Message("Creating Spot Fleet launch template...")
+	templateData := CreateTemplateData(userData, az, networkInterface, marketOptions)
+	launchTemplate := CreateLaunchTemplateInput{
+		LaunchTemplateData: &templateData,
+		LaunchTemplateName: "packer-fleet-launch-template",
+		VersionDescription: "template generated by packer for launching spot instances",
+	}
+
+	// Tell EC2 to create the template
+	_, err = ec2conn.CreateLaunchTemplate(launchTemplate)
+	if err != nil {
+		err := fmt.Errorf("Error creating launch template for spot instance: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
 
-	s.spotRequest = runSpotResp.SpotInstanceRequests[0]
+	// TODO (megan) delete the commented out overrides if it turns out they aren't
+	// necessary because the template handles it.
+	// override := ec2.FleetLaunchTemplateOverrides{
+	// 	MaxPrice:     &spotPrice,
+	// 	InstanceType: &s.InstanceType,
+	// }
 
-	spotRequestId := s.spotRequest.SpotInstanceRequestId
-	ui.Message(fmt.Sprintf("Waiting for spot request (%s) to become active...", *spotRequestId))
-	err = WaitUntilSpotRequestFulfilled(ctx, ec2conn, *spotRequestId)
-	if err != nil {
-		err := fmt.Errorf("Error waiting for spot request (%s) to become ready: %s", *spotRequestId, err)
-		state.Put("error", err)
-		ui.Error(err.Error())
-		return multistep.ActionHalt
+	createFleetInput := &ec2.CreateFleetInput{
+		LaunchTemplateConfigs: []*ec2.FleetLaunchTemplateConfigRequest{
+			*ec2.FleetLaunchTemplateConfigRequest{
+				LaunchTemplateSpecification: &ec2.FleetLaunchTemplateSpecificationRequest{
+					LaunchTemplateName: "packer-fleet-launch-template",
+					// Overrides:          []*ec2.FleetLaunchTemplateOverrides{override},
+				},
+			},
+		},
+		OnDemandOptions:                  &ec2.OnDemandOptionsRequest{},
+		ReplaceUnhealthyInstances:        false,
+		TargetCapacitySpecification:      &ec2.TargetCapacitySpecificationRequest{},
+		TerminateInstancesWithExpiration: true,
+		Type:                             "instant",
 	}
 
-	spotResp, err := ec2conn.DescribeSpotInstanceRequests(&ec2.DescribeSpotInstanceRequestsInput{
-		SpotInstanceRequestIds: []*string{spotRequestId},
-	})
-	if err != nil {
-		err := fmt.Errorf("Error finding spot request (%s): %s", *spotRequestId, err)
-		state.Put("error", err)
-		ui.Error(err.Error())
-		return multistep.ActionHalt
-	}
-	instanceId = *spotResp.SpotInstanceRequests[0].InstanceId
+	// Create the request for the spot instance.
+	req, createOutput := ec2conn.CreateFleetRequest(createFleetInput)
+	ui.Message(fmt.Sprintf("Sending spot request (%s)...", *req.spotRequestId))
 
-	// Tag spot instance request
+	// Tag the spot instance request (not the eventual spot instance)
 	spotTags, err := s.SpotTags.EC2Tags(s.Ctx, *ec2conn.Config.Region, state)
 	if err != nil {
-		err := fmt.Errorf("Error tagging spot request: %s", err)
+		err := fmt.Errorf("Error generating tags for spot request: %s", err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
@@ -248,7 +300,7 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		}.Run(ctx, func(ctx context.Context) error {
 			_, err := ec2conn.CreateTags(&ec2.CreateTagsInput{
 				Tags:      spotTags,
-				Resources: []*string{spotRequestId},
+				Resources: []*string{req.RequestId},
 			})
 			return err
 		})
@@ -260,20 +312,35 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		}
 	}
 
-	// Set the instance ID so that the cleanup works properly
-	s.instanceId = instanceId
+	// Actually send the spot connection request.
+	err = req.Send()
 
-	ui.Message(fmt.Sprintf("Instance ID: %s", instanceId))
-	ui.Say(fmt.Sprintf("Waiting for instance (%v) to become ready...", instanceId))
-	describeInstance := &ec2.DescribeInstancesInput{
-		InstanceIds: []*string{aws.String(instanceId)},
-	}
-	if err := ec2conn.WaitUntilInstanceRunningWithContext(ctx, describeInstance); err != nil {
-		err := fmt.Errorf("Error waiting for instance (%s) to become ready: %s", instanceId, err)
+	if err != nil {
+		err := fmt.Errorf("Error waiting for spot request (%s) to become ready: %s", *req.RequestId, err)
 		state.Put("error", err)
 		ui.Error(err.Error())
 		return multistep.ActionHalt
 	}
+
+	instanceId = createOutput.Instances[0].InstanceIds[0]
+
+	// Set the instance ID so that the cleanup works properly
+	s.instanceId = instanceId
+
+	ui.Message(fmt.Sprintf("Instance ID: %s", instanceId))
+
+	// TODO (megan): delete commented code if it turns out the above request is
+	// synchronous.
+	// ui.Say(fmt.Sprintf("Waiting for instance (%v) to become ready...", instanceId))
+	// describeInstance := &ec2.DescribeInstancesInput{
+	// 	InstanceIds: []*string{aws.String(instanceId)},
+	// }
+	// if err := ec2conn.WaitUntilInstanceRunningWithContext(ctx, describeInstance); err != nil {
+	// 	err := fmt.Errorf("Error waiting for instance (%s) to become ready: %s", instanceId, err)
+	// 	state.Put("error", err)
+	// 	ui.Error(err.Error())
+	// 	return multistep.ActionHalt
+	// }
 
 	r, err := ec2conn.DescribeInstances(&ec2.DescribeInstancesInput{
 		InstanceIds: []*string{aws.String(instanceId)},
