@@ -78859,7 +78859,7 @@ func (s *SpotInstanceStatus) SetUpdateTime(v time.Time) *SpotInstanceStatus {
 }
 
 // The options for Spot Instances.
-type LaunchTemplateSpotMarketOptions struct {
+type SpotMarketOptions struct {
 	_ struct{} `type:"structure"`
 
 	// The required duration for the Spot Instances (also known as Spot blocks),
