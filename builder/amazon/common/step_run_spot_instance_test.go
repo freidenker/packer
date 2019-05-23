@@ -74,7 +74,7 @@ func tStateSpot() multistep.StateBag {
 	})
 	state.Put("availability_zone", "us-east-1c")
 	state.Put("securityGroupIds", []string{"sg-0b8984db72f213dc3"})
-	state.Put("subnet_id", "")
+	state.Put("subnet_id", "subnet-077fde4e")
 	state.Put("source_image", "")
 	return state
 }

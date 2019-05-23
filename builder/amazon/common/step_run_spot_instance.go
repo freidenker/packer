@@ -137,7 +137,7 @@ func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
 	log.Printf("Megan securityGroupIds is %#v", state.Get("securityGroupIds"))
 	subnetId := state.Get("subnet_id").(string)
 	log.Printf("Megan subnet_id is %#v", subnetId)
-	if subnetId != "" && s.AssociatePublicIpAddress {
+	if subnetId != "" {
 		// Set up a full network interface
 		networkInterface := ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{
 			Groups:                   securityGroupIds,
@@ -148,7 +148,6 @@ func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
 		}
 		templateData.SetNetworkInterfaces([]*ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{&networkInterface})
 	} else {
-		// template.SubnetId = &subnetId
 		templateData.SetSecurityGroupIds(securityGroupIds)
 
 	}
