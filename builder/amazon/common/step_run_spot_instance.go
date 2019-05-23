@@ -13,6 +13,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ec2"
 
+	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/hashicorp/packer/common/retry"
 	"github.com/hashicorp/packer/helper/communicator"
 	"github.com/hashicorp/packer/helper/multistep"
@@ -45,7 +46,7 @@ type StepRunSpotInstance struct {
 	spotRequest *ec2.SpotInstanceRequest
 }
 
-func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn *ec2.EC2) (string, error) {
+func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn ec2iface.EC2API) (string, error) {
 	// Calculate the spot price for a given availability zone
 	spotPrice := s.SpotPrice
 
@@ -58,6 +59,7 @@ func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn *ec2.EC2) (s
 			AvailabilityZone:    &az,
 			StartTime:           &startTime,
 		})
+		log.Printf("MEGAN resp is %#v", *resp)
 		if err != nil {
 			return "", fmt.Errorf("Error finding spot price: %s", err)
 		}
@@ -132,7 +134,9 @@ func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
 	}
 	// Create a network interface
 	securityGroupIds := aws.StringSlice(state.Get("securityGroupIds").([]string))
+	log.Printf("Megan securityGroupIds is %#v", state.Get("securityGroupIds"))
 	subnetId := state.Get("subnet_id").(string)
+	log.Printf("Megan subnet_id is %#v", subnetId)
 	if subnetId != "" && s.AssociatePublicIpAddress {
 		// Set up a full network interface
 		networkInterface := ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{
@@ -187,8 +191,10 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 
 	ui.Say("Launching a spot AWS instance...")
 
+	log.Printf("Megan step is %#v", *s)
 	// Get and validate the source AMI
 	image, ok := state.Get("source_image").(*ec2.Image)
+	log.Printf("Megan source_image is %#v", *image)
 	if !ok {
 		state.Put("error", fmt.Errorf("source_image type assertion failed"))
 		return multistep.ActionHalt
@@ -289,7 +295,7 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 
 	createFleetInput := &ec2.CreateFleetInput{
 		LaunchTemplateConfigs: []*ec2.FleetLaunchTemplateConfigRequest{
-			&ec2.FleetLaunchTemplateConfigRequest{
+			{
 				LaunchTemplateSpecification: &ec2.FleetLaunchTemplateSpecificationRequest{
 					LaunchTemplateName: aws.String("packer-fleet-launch-template"),
 					Version:            aws.String("1"),
