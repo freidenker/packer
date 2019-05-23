@@ -36,6 +36,7 @@ type StepRunSpotInstance struct {
 	SpotPrice                         string
 	SpotPriceProduct                  string
 	SpotTags                          TagMap
+	SpotInstanceTypes                 []string
 	Tags                              TagMap
 	VolumeTags                        TagMap
 	UserData                          string
@@ -283,17 +284,25 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		return multistep.ActionHalt
 	}
 
+	// Add overrides for each user-provided instance type
+	var overrides []*ec2.FleetLaunchTemplateOverridesRequest
+	for _, instanceType := range s.SpotInstanceTypes {
+		override := ec2.FleetLaunchTemplateOverridesRequest{
+			InstanceType: aws.String(instanceType),
+		}
+		overrides = append(overrides, &override)
+	}
+
 	createFleetInput := &ec2.CreateFleetInput{
 		LaunchTemplateConfigs: []*ec2.FleetLaunchTemplateConfigRequest{
 			{
 				LaunchTemplateSpecification: &ec2.FleetLaunchTemplateSpecificationRequest{
 					LaunchTemplateName: aws.String("packer-fleet-launch-template"),
 					Version:            aws.String("1"),
-					// Overrides:          []*ec2.FleetLaunchTemplateOverrides{override},
 				},
+				Overrides: overrides,
 			},
 		},
-		OnDemandOptions:           &ec2.OnDemandOptionsRequest{},
 		ReplaceUnhealthyInstances: aws.Bool(false),
 		TargetCapacitySpecification: &ec2.TargetCapacitySpecificationRequest{
 			TotalTargetCapacity:       aws.Int64(1),
