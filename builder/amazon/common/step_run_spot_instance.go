@@ -140,11 +140,13 @@ func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
 	if subnetId != "" {
 		// Set up a full network interface
 		networkInterface := ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{
-			Groups:                   securityGroupIds,
-			DeleteOnTermination:      aws.Bool(true),
-			DeviceIndex:              aws.Int64(0),
-			AssociatePublicIpAddress: &s.AssociatePublicIpAddress,
-			SubnetId:                 aws.String(subnetId),
+			Groups:              securityGroupIds,
+			DeleteOnTermination: aws.Bool(true),
+			DeviceIndex:         aws.Int64(0),
+			SubnetId:            aws.String(subnetId),
+		}
+		if s.AssociatePublicIpAddress {
+			networkInterface.SetAssociatePublicIpAddress(s.AssociatePublicIpAddress)
 		}
 		templateData.SetNetworkInterfaces([]*ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{&networkInterface})
 	} else {
