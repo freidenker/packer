@@ -59,7 +59,6 @@ func (s *StepRunSpotInstance) CalculateSpotPrice(az string, ec2conn ec2iface.EC2
 			AvailabilityZone:    &az,
 			StartTime:           &startTime,
 		})
-		log.Printf("MEGAN resp is %#v", *resp)
 		if err != nil {
 			return "", fmt.Errorf("Error finding spot price: %s", err)
 		}
@@ -134,9 +133,8 @@ func (s *StepRunSpotInstance) CreateTemplateData(userData *string, az string,
 	}
 	// Create a network interface
 	securityGroupIds := aws.StringSlice(state.Get("securityGroupIds").([]string))
-	log.Printf("Megan securityGroupIds is %#v", state.Get("securityGroupIds"))
 	subnetId := state.Get("subnet_id").(string)
-	log.Printf("Megan subnet_id is %#v", subnetId)
+
 	if subnetId != "" {
 		// Set up a full network interface
 		networkInterface := ec2.LaunchTemplateInstanceNetworkInterfaceSpecificationRequest{
@@ -192,10 +190,8 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 
 	ui.Say("Launching a spot AWS instance...")
 
-	log.Printf("Megan step is %#v", *s)
 	// Get and validate the source AMI
 	image, ok := state.Get("source_image").(*ec2.Image)
-	log.Printf("Megan source_image is %#v", *image)
 	if !ok {
 		state.Put("error", fmt.Errorf("source_image type assertion failed"))
 		return multistep.ActionHalt
@@ -287,13 +283,6 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 		return multistep.ActionHalt
 	}
 
-	// TODO (megan) delete the commented out overrides if it turns out they aren't
-	// necessary because the template handles it.
-	// override := ec2.FleetLaunchTemplateOverrides{
-	// 	MaxPrice:     &spotPrice,
-	// 	InstanceType: &s.InstanceType,
-	// }
-
 	createFleetInput := &ec2.CreateFleetInput{
 		LaunchTemplateConfigs: []*ec2.FleetLaunchTemplateConfigRequest{
 			{
@@ -370,19 +359,6 @@ func (s *StepRunSpotInstance) Run(ctx context.Context, state multistep.StateBag)
 	s.instanceId = instanceId
 
 	ui.Message(fmt.Sprintf("Instance ID: %s", instanceId))
-
-	// TODO (megan): delete commented code if it turns out the above request is
-	// synchronous.
-	// ui.Say(fmt.Sprintf("Waiting for instance (%v) to become ready...", instanceId))
-	// describeInstance := &ec2.DescribeInstancesInput{
-	// 	InstanceIds: []*string{aws.String(instanceId)},
-	// }
-	// if err := ec2conn.WaitUntilInstanceRunningWithContext(ctx, describeInstance); err != nil {
-	// 	err := fmt.Errorf("Error waiting for instance (%s) to become ready: %s", instanceId, err)
-	// 	state.Put("error", err)
-	// 	ui.Error(err.Error())
-	// 	return multistep.ActionHalt
-	// }
 
 	r, err := ec2conn.DescribeInstances(&ec2.DescribeInstancesInput{
 		InstanceIds: []*string{aws.String(instanceId)},
