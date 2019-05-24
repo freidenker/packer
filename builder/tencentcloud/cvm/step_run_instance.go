@@ -59,6 +59,7 @@ func (s *stepRunInstance) Run(ctx context.Context, state multistep.StateBag) mul
 	}
 	req.ImageId = source_image.ImageId
 	req.InstanceChargeType = &POSTPAID_BY_HOUR
+
 	req.InstanceType = &s.InstanceType
 	req.SystemDisk = &cvm.SystemDisk{
 		DiskType: &s.DiskType,
@@ -68,10 +69,10 @@ func (s *stepRunInstance) Run(ctx context.Context, state multistep.StateBag) mul
 		VpcId:    &vpc_id,
 		SubnetId: &subnet_id,
 	}
-	TRAFFIC_POSTPAID_BY_HOUR := "TRAFFIC_POSTPAID_BY_HOUR"
+	BANDWIDTH_PACKAGE := "BANDWIDTH_PACKAGE"
 	if s.AssociatePublicIpAddress {
 		req.InternetAccessible = &cvm.InternetAccessible{
-			InternetChargeType:      &TRAFFIC_POSTPAID_BY_HOUR,
+			InternetChargeType:      &BANDWIDTH_PACKAGE,
 			InternetMaxBandwidthOut: &s.InternetMaxBandwidthOut,
 		}
 	}
